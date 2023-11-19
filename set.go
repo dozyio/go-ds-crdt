@@ -34,11 +34,13 @@ var (
 // Value. When two values have the same priority, it chooses by alphabetically
 // sorting their unique IDs alphabetically.
 type set struct {
-	store      ds.Datastore
-	namespace  ds.Key
-	putHook    func(key string, v []byte)
-	deleteHook func(key string)
-	logger     logging.StandardLogger
+	store          ds.Datastore
+	namespace      ds.Key
+	putPreHook     func(key string, v []byte) error
+	putPostHook    func(key string, v []byte)
+	deletePreHook  func(key string) error
+	deletePostHook func(key string)
+	logger         logging.StandardLogger
 
 	// Avoid merging two things at the same time since
 	// we read-write value-priorities in a non-atomic way.
@@ -63,8 +65,10 @@ func newCRDTSet(
 	d ds.Datastore,
 	namespace ds.Key,
 	logger logging.StandardLogger,
-	putHook func(key string, v []byte),
-	deleteHook func(key string),
+	putPreHook func(key string, v []byte) error,
+	putPostHook func(key string, v []byte),
+	deletePreHook func(key string) error,
+	deletePostHook func(key string),
 ) (*set, error) {
 
 	blm, err := bloom.New(
@@ -79,8 +83,10 @@ func newCRDTSet(
 		namespace:       namespace,
 		store:           d,
 		logger:          logger,
-		putHook:         putHook,
-		deleteHook:      deleteHook,
+		putPreHook:      putPreHook,
+		putPostHook:     putPostHook,
+		deletePreHook:   deletePreHook,
+		deletePostHook:  deletePostHook,
 		tombstonesBloom: blm,
 	}
 
@@ -476,6 +482,10 @@ func (s *set) setPriority(ctx context.Context, writeStore ds.Write, key string, 
 // sets a value if priority is higher. When equal, it sets if the
 // value is lexicographically higher than the current value.
 func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string, value []byte, prio uint64) error {
+	err := s.putPreHook(key, value)
+	if err != nil {
+		return err
+	}
 	// If this key was tombstoned already, do not store/update the value
 	// at all.
 	deleted, err := s.inTombsKeyID(ctx, key, id)
@@ -513,8 +523,8 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 		return err
 	}
 
-	// trigger add hook
-	s.putHook(key, value)
+	// trigger add post hook
+	s.putPostHook(key, value)
 	return nil
 }
 
@@ -592,8 +602,14 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 	for _, e := range tombs {
 		// /namespace/tombs/<key>/<id>
 		elemKey := e.GetKey()
+
+		err := s.deletePreHook(elemKey)
+		if err != nil {
+			return err
+		}
+
 		k := s.tombsPrefix(elemKey).ChildString(e.GetId())
-		err := store.Put(ctx, k, nil)
+		err = store.Put(ctx, k, nil)
 		if err != nil {
 			return err
 		}
@@ -604,7 +620,7 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		// in this delta
 		if _, ok := deletedElems[elemKey]; !ok {
 			deletedElems[elemKey] = struct{}{}
-			s.deleteHook(elemKey)
+			s.deletePostHook(elemKey)
 		}
 	}
 

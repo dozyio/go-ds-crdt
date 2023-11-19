@@ -77,19 +77,30 @@ type SessionDAGService interface {
 type Options struct {
 	Logger              logging.StandardLogger
 	RebroadcastInterval time.Duration
-	// The PutHook function is triggered whenever an element
+	// The PutPreHook function is triggered before an element
+	// is added to the datastore (either by a local or remote update),
+	// and only when that addition is considered the prevalent value.
+	PutPreHook func(k ds.Key, v []byte) error
+	// The PutPostHook function is triggered whenever an element
 	// is successfully added to the datastore (either by a local
 	// or remote update), and only when that addition is considered the
 	// prevalent value.
-	PutHook func(k ds.Key, v []byte)
-	// The DeleteHook function is triggered whenever a version of an
+	PutPostHook func(k ds.Key, v []byte)
+	// The DeletePreHook function is triggered before an element is removed
+	// from the datastore (either by a local or remote update).
+	// Unordered and concurrent updates may result in the DeletePreHook being
+	// triggered even though the element is still present in the datastore
+	// because it was re-added. If that is relevant, use Has() to check if the
+	// removed element is still part of the datastore.
+	DeletePreHook func(k ds.Key) error
+	// The DeletePostHook function is triggered whenever a version of an
 	// element is successfully removed from the datastore (either by a
 	// local or remote update). Unordered and concurrent updates may
-	// result in the DeleteHook being triggered even though the element is
+	// result in the DeletePostHook being triggered even though the element is
 	// still present in the datastore because it was re-added. If that is
 	// relevant, use Has() to check if the removed element is still part
 	// of the datastore.
-	DeleteHook func(k ds.Key)
+	DeletePostHook func(k ds.Key)
 	// NumWorkers specifies the number of workers ready to walk DAGs
 	NumWorkers int
 	// DAGSyncerTimeout specifies how long to wait for a DAGSyncer.
@@ -146,8 +157,10 @@ func DefaultOptions() *Options {
 	return &Options{
 		Logger:              logging.Logger("crdt"),
 		RebroadcastInterval: time.Minute,
-		PutHook:             nil,
-		DeleteHook:          nil,
+		PutPreHook:          nil,
+		PutPostHook:         nil,
+		DeletePreHook:       nil,
+		DeletePostHook:      nil,
 		NumWorkers:          5,
 		DAGSyncerTimeout:    5 * time.Minute,
 		// always keeping
@@ -240,24 +253,40 @@ func New(
 	// <namespace>/heads
 	fullHeadsNs := namespace.ChildString(headsNs)
 
-	setPutHook := func(k string, v []byte) {
-		if opts.PutHook == nil {
-			return
+	setPutPreHook := func(k string, v []byte) error {
+		if opts.PutPreHook == nil {
+			return nil
 		}
 		dsk := ds.NewKey(k)
-		opts.PutHook(dsk, v)
+		return opts.PutPreHook(dsk, v)
 	}
 
-	setDeleteHook := func(k string) {
-		if opts.DeleteHook == nil {
+	setPutPostHook := func(k string, v []byte) {
+		if opts.PutPostHook == nil {
 			return
 		}
 		dsk := ds.NewKey(k)
-		opts.DeleteHook(dsk)
+		opts.PutPostHook(dsk, v)
+	}
+
+	setDeletePreHook := func(k string) error {
+		if opts.DeletePreHook == nil {
+			return nil
+		}
+		dsk := ds.NewKey(k)
+		return opts.DeletePreHook(dsk)
+	}
+
+	setDeletePostHook := func(k string) {
+		if opts.DeletePostHook == nil {
+			return
+		}
+		dsk := ds.NewKey(k)
+		opts.DeletePostHook(dsk)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	set, err := newCRDTSet(ctx, store, fullSetNs, opts.Logger, setPutHook, setDeleteHook)
+	set, err := newCRDTSet(ctx, store, fullSetNs, opts.Logger, setPutPreHook, setPutPostHook, setDeletePreHook, setDeletePostHook)
 	if err != nil {
 		cancel()
 		return nil, errors.Wrap(err, "error setting up crdt set")
@@ -1135,7 +1164,6 @@ func deltaMerge(d1, d2 *pb.Delta) *pb.Delta {
 // returns delta size and error
 func (store *Datastore) addToDelta(ctx context.Context, key string, value []byte) (int, error) {
 	return store.updateDelta(store.set.Add(ctx, key, value)), nil
-
 }
 
 // returns delta size and error

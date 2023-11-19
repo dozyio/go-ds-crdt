@@ -1,10 +1,12 @@
 package crdt
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -101,7 +103,9 @@ type mockBroadcaster struct {
 	t        testing.TB
 }
 
-func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFunc) {
+func newBroadcasters(tb testing.TB, n int) ([]*mockBroadcaster, context.CancelFunc) {
+	tb.Helper()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	broadcasters := make([]*mockBroadcaster, n)
 	chans := make([]chan []byte, n)
@@ -112,7 +116,7 @@ func newBroadcasters(t testing.TB, n int) ([]*mockBroadcaster, context.CancelFun
 			chans:    chans,
 			myChan:   chans[i],
 			dropProb: 0,
-			t:        t,
+			t:        tb,
 		}
 	}
 	return broadcasters, cancel
@@ -137,7 +141,6 @@ func (mb *mockBroadcaster) Broadcast(data []byte) error {
 				// Sleep for a very small time that will
 				// effectively be pretty random
 				time.Sleep(time.Nanosecond)
-
 			}
 			timer := time.NewTimer(5 * time.Second)
 			defer timer.Stop()
@@ -187,8 +190,8 @@ func storeFolder(i int) string {
 	return fmt.Sprintf("test-badger-%d", i)
 }
 
-func makeStore(t testing.TB, i int) ds.Datastore {
-	t.Helper()
+func makeStore(tb testing.TB, i int) ds.Datastore {
+	tb.Helper()
 
 	switch store {
 	case mapStore:
@@ -197,7 +200,7 @@ func makeStore(t testing.TB, i int) ds.Datastore {
 		folder := storeFolder(i)
 		err := os.MkdirAll(folder, 0700)
 		if err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
 
 		badgerOpts := badger.DefaultOptions("")
@@ -207,17 +210,18 @@ func makeStore(t testing.TB, i int) ds.Datastore {
 		opts := badgerds.Options{Options: badgerOpts}
 		dstore, err := badgerds.NewDatastore(folder, &opts)
 		if err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
 		return dstore
 	default:
-		t.Fatal("bad store type selected for tests")
+		tb.Fatal("bad store type selected for tests")
 		return nil
-
 	}
 }
 
 func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
+	t.Helper()
+
 	bcasts, bcastCancel := newBroadcasters(t, n)
 	bs := mdutils.Bserv()
 	dagserv := merkledag.NewDAGService(bs)
@@ -227,8 +231,8 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 		if opts == nil {
 			replicaOpts[i] = DefaultOptions()
 		} else {
-			copy := *opts
-			replicaOpts[i] = &copy
+			oCopy := *opts
+			replicaOpts[i] = &oCopy
 		}
 
 		replicaOpts[i].Logger = &testLogger{
@@ -282,6 +286,8 @@ func makeNReplicas(t testing.TB, n int, opts *Options) ([]*Datastore, func()) {
 }
 
 func makeReplicas(t testing.TB, opts *Options) ([]*Datastore, func()) {
+	t.Helper()
+
 	return makeNReplicas(t, numReplicas, opts)
 }
 
@@ -319,7 +325,7 @@ func TestCRDTReplication(t *testing.T) {
 	// Add nItems choosing the replica randomly
 	for i := 0; i < nItems; i++ {
 		k := ds.RandomKey()
-		v := []byte(fmt.Sprintf("%d", i))
+		v := []byte(strconv.Itoa(i))
 		n := randGen.Intn(len(replicas))
 		err := replicas[n].Put(ctx, k, v)
 		if err != nil {
@@ -453,7 +459,7 @@ func TestCRDTPriority(t *testing.T) {
 			t.Error(err)
 		}
 		t.Logf("Replica %d got value %s", i, string(v))
-		if lastv != nil && string(v) != string(lastv) {
+		if lastv != nil && !bytes.Equal(v, lastv) {
 			t.Error("value was different between replicas, but should be the same")
 		}
 		lastv = v
@@ -549,15 +555,25 @@ func TestCRDTPrintDAG(t *testing.T) {
 func TestCRDTHooks(t *testing.T) {
 	ctx := context.Background()
 
-	var put int64
-	var deleted int64
+	var putPre int64
+	var putPost int64
+	var deletedPre int64
+	var deletedPost int64
 
 	opts := DefaultOptions()
-	opts.PutHook = func(k ds.Key, v []byte) {
-		atomic.AddInt64(&put, 1)
+	opts.PutPreHook = func(k ds.Key, v []byte) error {
+		atomic.AddInt64(&putPre, 1)
+		return nil
 	}
-	opts.DeleteHook = func(k ds.Key) {
-		atomic.AddInt64(&deleted, 1)
+	opts.PutPostHook = func(k ds.Key, v []byte) {
+		atomic.AddInt64(&putPost, 1)
+	}
+	opts.DeletePreHook = func(k ds.Key) error {
+		atomic.AddInt64(&deletedPre, 1)
+		return nil
+	}
+	opts.DeletePostHook = func(k ds.Key) {
+		atomic.AddInt64(&deletedPost, 1)
 	}
 
 	replicas, closeReplicas := makeReplicas(t, opts)
@@ -574,11 +590,17 @@ func TestCRDTHooks(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
-	if atomic.LoadInt64(&put) != int64(len(replicas)) {
-		t.Error("all replicas should have notified Put", put)
+	if atomic.LoadInt64(&putPre) != int64(len(replicas)) {
+		t.Error("all replicas should have notified Put Pre", putPre)
 	}
-	if atomic.LoadInt64(&deleted) != int64(len(replicas)) {
-		t.Error("all replicas should have notified Remove", deleted)
+	if atomic.LoadInt64(&putPost) != int64(len(replicas)) {
+		t.Error("all replicas should have notified Put Post", putPost)
+	}
+	if atomic.LoadInt64(&deletedPre) != int64(len(replicas)) {
+		t.Error("all replicas should have notified Remove Pre", deletedPre)
+	}
+	if atomic.LoadInt64(&deletedPost) != int64(len(replicas)) {
+		t.Error("all replicas should have notified Remove Post", deletedPost)
 	}
 }
 
@@ -604,7 +626,7 @@ func TestCRDTBatch(t *testing.T) {
 	}
 
 	if _, err := replicas[0].Get(ctx, k); err != ds.ErrNotFound {
-		t.Fatal("should not have commited the batch")
+		t.Fatal("should not have committed the batch")
 	}
 
 	k2 := ds.RandomKey()
@@ -614,7 +636,7 @@ func TestCRDTBatch(t *testing.T) {
 	}
 
 	if _, err := replicas[0].Get(ctx, k2); err != nil {
-		t.Fatal("should have commited the batch: delta size was over threshold")
+		t.Fatal("should have committed the batch: delta size was over threshold")
 	}
 
 	err = btch.Delete(ctx, k)
@@ -902,6 +924,8 @@ func BenchmarkQueryElements(b *testing.B) {
 }
 
 func TestRandomizeInterval(t *testing.T) {
+	t.Parallel()
+
 	prevR := 100 * time.Second
 	for i := 0; i < 1000; i++ {
 		r := randomizeInterval(100 * time.Second)
