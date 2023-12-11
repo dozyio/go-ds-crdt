@@ -555,11 +555,11 @@ func TestCRDTFilterElements(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.Filter = func(delta *pb.Delta) {
-		filterElements := func(elems []*pb.Element) []*pb.Element {
+		filter := func(elems []*pb.Element) []*pb.Element {
 			allowedElements := make([]*pb.Element, 0, len(elems))
 
 			for _, e := range elems {
-				if strings.HasPrefix(e.Key, "/a") {
+				if json.Valid(e.Value) {
 					allowedElements = append(allowedElements, e)
 				}
 			}
@@ -567,36 +567,39 @@ func TestCRDTFilterElements(t *testing.T) {
 			return allowedElements
 		}
 
-		delta.Elements = filterElements(delta.Elements)
+		delta.Elements = filter(delta.Elements)
 	}
 
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
-	keys := []ds.Key{}
-	keys = append(keys, ds.NewKey("/a1")) // allowed
-	keys = append(keys, ds.NewKey("/b1")) // not allowed
+	kv := make(map[ds.Key][]byte)
+	kv[ds.NewKey("/10")] = []byte(`{"test": 10}`) // ok
+	kv[ds.NewKey("/11")] = []byte(`not json`)     // filtered out
+	kv[ds.NewKey("/20")] = []byte(`{"test": 11}`) // ok
+	kv[ds.NewKey("/21")] = []byte(`not json`)     // filtered out
 
-	allowedKeys := 1
-	allowedKeysCount := 0
+	expectedKeyCount := 2 * len(replicas)
+	keysCount := 0
 
-	for i := 0; i < len(keys); i++ {
-		err := replicas[0].Put(ctx, keys[i], []byte("test"))
+	for k, v := range kv {
+		err := replicas[0].Put(ctx, k, v)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		time.Sleep(100 * time.Millisecond)
+
 		for _, r := range replicas {
-			_, err := r.Get(ctx, keys[i])
+			_, err := r.Get(ctx, k)
 			if err == nil {
-				allowedKeysCount++
+				keysCount++
 			}
 		}
 	}
 
-	if allowedKeysCount != allowedKeys*len(replicas) {
-		t.Errorf("expected %d keys, got %d", allowedKeys*len(replicas), allowedKeysCount)
+	if keysCount != expectedKeyCount {
+		t.Errorf("expected %d keys, got %d", expectedKeyCount, keysCount)
 	}
 }
 
@@ -605,11 +608,11 @@ func TestCRDTFilterTombstones(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.Filter = func(delta *pb.Delta) {
-		filterTombstones := func(elems []*pb.Element) []*pb.Element {
+		filter := func(elems []*pb.Element) []*pb.Element {
 			allowedTombstones := make([]*pb.Element, 0, len(elems))
 
 			for _, e := range elems {
-				if strings.HasPrefix(e.Key, "/a") {
+				if strings.HasPrefix(e.Key, "/1") {
 					allowedTombstones = append(allowedTombstones, e)
 				}
 			}
@@ -617,16 +620,20 @@ func TestCRDTFilterTombstones(t *testing.T) {
 			return allowedTombstones
 		}
 
-		delta.Tombstones = filterTombstones(delta.Tombstones)
+		delta.Tombstones = filter(delta.Tombstones)
 	}
 
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
-	keys := []ds.Key{}
-	keys = append(keys, ds.NewKey("/a1")) // allowed
-	keys = append(keys, ds.NewKey("/b1")) // not allowed
+	keys := []ds.Key{
+		ds.NewKey("/10"), // should allow tombstone
+		ds.NewKey("/20"), // should not allow tombstone
+		ds.NewKey("/11"), // should allow tombstone
+		ds.NewKey("/21"), // should not allow tombstone
+	}
 
+	// populate the relicas
 	for i := 0; i < len(keys); i++ {
 		err := replicas[0].Put(ctx, keys[i], []byte("test"))
 		if err != nil {
@@ -637,11 +644,12 @@ func TestCRDTFilterTombstones(t *testing.T) {
 		for _, r := range replicas {
 			_, err := r.Get(ctx, keys[i])
 			if err != nil {
-				t.Errorf("all replicas should have %s", keys[i].String())
+				t.Errorf("replica should have %s", keys[i].String())
 			}
 		}
 	}
 
+	// delete from replicas
 	for i := 0; i < len(keys); i++ {
 		err := replicas[0].Delete(ctx, keys[i])
 		if err != nil {
@@ -652,15 +660,15 @@ func TestCRDTFilterTombstones(t *testing.T) {
 		for _, r := range replicas {
 			v, err := r.Get(ctx, keys[i])
 
-			if strings.HasPrefix(keys[i].String(), "/a") {
+			if strings.HasPrefix(keys[i].String(), "/1") {
 				if err != nil && v != nil {
-					t.Errorf("all replicas should have deleted %s", keys[i].String())
+					t.Errorf("replica should have deleted %s", keys[i].String())
 				}
 			}
 
-			if !strings.HasPrefix(keys[i].String(), "/a") {
+			if strings.HasPrefix(keys[i].String(), "/2") {
 				if err != nil {
-					t.Errorf("all replicas should not have deleted %s", keys[i].String())
+					t.Errorf("replicas should not have deleted %s", keys[i].String())
 				}
 			}
 		}
@@ -669,6 +677,8 @@ func TestCRDTFilterTombstones(t *testing.T) {
 
 func TestCRDTFilterIgnoreBadElements(t *testing.T) {
 	ctx := context.Background()
+
+	optsWithoutFilter := DefaultOptions()
 
 	optsWithFilter := DefaultOptions()
 	optsWithFilter.Filter = func(delta *pb.Delta) {
@@ -687,18 +697,16 @@ func TestCRDTFilterIgnoreBadElements(t *testing.T) {
 		delta.Elements = filterElements(delta.Tombstones)
 	}
 
-	replicasWithFilter, closeReplicasWithFilter := makeNReplicas(t, 5, optsWithFilter)
-	defer closeReplicasWithFilter()
-
-	optsWithoutFilter := DefaultOptions()
-
 	replicasWithoutFilter, closeReplicasWithoutFilter := makeNReplicas(t, 1, optsWithoutFilter)
 	defer closeReplicasWithoutFilter()
+
+	replicasWithFilter, closeReplicasWithFilter := makeNReplicas(t, 5, optsWithFilter)
+	defer closeReplicasWithFilter()
 
 	keys := []ds.Key{}
 	keys = append(keys, ds.NewKey("/test"))
 
-	notJson := []byte("{{NOT JSON}}")
+	notJson := []byte("not json")
 
 	for i := 0; i < len(keys); i++ {
 		// replica without filter should accept invalid json
@@ -713,14 +721,15 @@ func TestCRDTFilterIgnoreBadElements(t *testing.T) {
 		}
 
 		if !bytes.Equal(notJson, v) {
-			t.Fatal("should have returned the same value")
+			t.Fatal("replica should have returned the same value")
 		}
 
 		time.Sleep(100 * time.Millisecond)
+		// replicas with filter should not have stored the record
 		for _, r := range replicasWithFilter {
 			_, err := r.Get(ctx, keys[i])
 			if err == nil {
-				t.Errorf("all replicas should not have %s", keys[i].String())
+				t.Errorf("filter replica should not have %s", keys[i].String())
 			}
 		}
 	}
