@@ -128,7 +128,7 @@ func (s *set) primeBloomFilter(ctx context.Context) error {
 
 // Add returns a new delta-set adding the given key/value.
 func (s *set) Add(ctx context.Context, key string, value []byte) *pb.Delta {
-	d := &pb.Delta{
+	delta := &pb.Delta{
 		Elements: []*pb.Element{
 			{
 				Key:   key,
@@ -139,10 +139,10 @@ func (s *set) Add(ctx context.Context, key string, value []byte) *pb.Delta {
 	}
 
 	if s.filter != nil {
-		s.filter(d)
+		s.filter(delta)
 	}
 
-	return d
+	return delta
 }
 
 // Rmv returns a new delta-set removing the given key.
