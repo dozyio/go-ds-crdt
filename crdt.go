@@ -690,6 +690,10 @@ loop:
 			store.set.filter(deltaOpt.delta)
 		}
 
+		if len(deltaOpt.delta.Tombstones) == 0 && len(deltaOpt.delta.Elements) == 0 {
+			continue
+		}
+
 		session.Add(1)
 		job := &dagJob{
 			session:    session,
