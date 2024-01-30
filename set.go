@@ -36,6 +36,7 @@ var (
 type set struct {
 	store      ds.Datastore
 	namespace  ds.Key
+	filter     func(delta *pb.Delta)
 	putHook    func(key string, v []byte)
 	deleteHook func(key string)
 	logger     logging.StandardLogger
@@ -63,6 +64,7 @@ func newCRDTSet(
 	d ds.Datastore,
 	namespace ds.Key,
 	logger logging.StandardLogger,
+	filter func(delta *pb.Delta),
 	putHook func(key string, v []byte),
 	deleteHook func(key string),
 ) (*set, error) {
@@ -79,6 +81,7 @@ func newCRDTSet(
 		namespace:       namespace,
 		store:           d,
 		logger:          logger,
+		filter:          filter,
 		putHook:         putHook,
 		deleteHook:      deleteHook,
 		tombstonesBloom: blm,
@@ -125,7 +128,7 @@ func (s *set) primeBloomFilter(ctx context.Context) error {
 
 // Add returns a new delta-set adding the given key/value.
 func (s *set) Add(ctx context.Context, key string, value []byte) *pb.Delta {
-	return &pb.Delta{
+	delta := &pb.Delta{
 		Elements: []*pb.Element{
 			{
 				Key:   key,
@@ -134,6 +137,12 @@ func (s *set) Add(ctx context.Context, key string, value []byte) *pb.Delta {
 		},
 		Tombstones: nil,
 	}
+
+	if s.filter != nil {
+		s.filter(delta)
+	}
+
+	return delta
 }
 
 // Rmv returns a new delta-set removing the given key.
@@ -180,6 +189,11 @@ func (s *set) Rmv(ctx context.Context, key string) (*pb.Delta, error) {
 			})
 		}
 	}
+
+	if s.filter != nil {
+		s.filter(delta)
+	}
+
 	return delta, nil
 }
 
