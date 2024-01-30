@@ -77,7 +77,7 @@ type SessionDAGService interface {
 type Options struct {
 	Logger              logging.StandardLogger
 	RebroadcastInterval time.Duration
-	// TODO comment
+	// The Filter function is triggered whenever a new delta is received
 	Filter func(*pb.Delta)
 	// The PutHook function is triggered whenever an element
 	// is successfully added to the datastore (either by a local

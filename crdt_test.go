@@ -573,11 +573,12 @@ func TestCRDTFilterElements(t *testing.T) {
 	replicas, closeReplicas := makeReplicas(t, opts)
 	defer closeReplicas()
 
+	jsonOk := []byte(`{"test": "ok"}`)
 	kv := make(map[ds.Key][]byte)
-	kv[ds.NewKey("/10")] = []byte(`{"test": 10}`) // ok
-	kv[ds.NewKey("/11")] = []byte(`not json`)     // filtered out
-	kv[ds.NewKey("/20")] = []byte(`{"test": 11}`) // ok
-	kv[ds.NewKey("/21")] = []byte(`not json`)     // filtered out
+	kv[ds.NewKey("/10")] = jsonOk             // ok
+	kv[ds.NewKey("/11")] = []byte(`not json`) // filtered out
+	kv[ds.NewKey("/20")] = jsonOk             // ok
+	kv[ds.NewKey("/21")] = []byte(`not json`) // filtered out
 
 	expectedKeyCount := 2 * len(replicas)
 	keysCount := 0
@@ -591,8 +592,8 @@ func TestCRDTFilterElements(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 
 		for _, r := range replicas {
-			_, err := r.Get(ctx, k)
-			if err == nil {
+			v, err := r.Get(ctx, k)
+			if err == nil && bytes.Equal(v, jsonOk) {
 				keysCount++
 			}
 		}
