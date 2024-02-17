@@ -52,7 +52,8 @@ const (
 
 // Common errors.
 var (
-	ErrNoMoreBroadcast = errors.New("receiving blocks aborted since no new blocks will be broadcasted")
+	ErrNoMoreBroadcast  = errors.New("receiving blocks aborted since no new blocks will be broadcasted")
+	ErrNothingToPublish = errors.New("nothing to publish")
 )
 
 // A Broadcaster provides a way to send (notify) an opaque payload to
@@ -1061,7 +1062,31 @@ func (store *Datastore) Query(ctx context.Context, q query.Query) (query.Results
 // Put stores the object `value` named by `key`.
 func (store *Datastore) Put(ctx context.Context, key ds.Key, value []byte) error {
 	delta := store.set.Add(ctx, key.String(), value)
-	return store.publish(ctx, delta)
+
+	err := store.publish(ctx, delta)
+	if err != nil {
+		if errors.Is(err, ErrNothingToPublish) {
+			return nil
+		}
+		return err
+	}
+
+	return nil
+}
+
+// Put stores the object `value` named by `key` and returns the number added.
+func (store *Datastore) PutWithCount(ctx context.Context, key ds.Key, value []byte) (int, error) {
+	delta := store.set.Add(ctx, key.String(), value)
+
+	err := store.publish(ctx, delta)
+	if err != nil {
+		if errors.Is(err, ErrNothingToPublish) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	return len(delta.Elements), nil
 }
 
 // Delete removes the value for given `key`.
@@ -1074,7 +1099,37 @@ func (store *Datastore) Delete(ctx context.Context, key ds.Key) error {
 	if len(delta.Tombstones) == 0 {
 		return nil
 	}
-	return store.publish(ctx, delta)
+	err = store.publish(ctx, delta)
+	if err != nil {
+		if errors.Is(err, ErrNothingToPublish) {
+			return nil
+		}
+		return err
+	}
+
+	return nil
+}
+
+// Delete removes the value for given `key` and returns the number deleted.
+func (store *Datastore) DeleteWithCount(ctx context.Context, key ds.Key) (int, error) {
+	delta, err := store.set.Rmv(ctx, key.String())
+	if err != nil {
+		return 0, err
+	}
+
+	if len(delta.Tombstones) == 0 {
+		return 0, nil
+	}
+
+	err = store.publish(ctx, delta)
+	if err != nil {
+		if errors.Is(err, ErrNothingToPublish) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	return len(delta.Tombstones), nil
 }
 
 // Sync ensures that all the data under the given prefix is flushed to disk in
@@ -1207,6 +1262,9 @@ func (store *Datastore) publishDelta(ctx context.Context) error {
 	defer store.curDeltaMux.Unlock()
 	err := store.publish(ctx, store.curDelta)
 	if err != nil {
+		if errors.Is(err, ErrNothingToPublish) {
+			return nil
+		}
 		return err
 	}
 	store.curDelta = nil
@@ -1235,7 +1293,7 @@ func (store *Datastore) putBlock(heads []cid.Cid, height uint64, delta *pb.Delta
 func (store *Datastore) publish(ctx context.Context, delta *pb.Delta) error {
 	// curDelta might be nil if nothing has been added to it
 	if delta == nil || (len(delta.Elements) == 0 && len(delta.Tombstones) == 0) {
-		return nil
+		return ErrNothingToPublish
 	}
 
 	c, err := store.addDAGNode(delta)
