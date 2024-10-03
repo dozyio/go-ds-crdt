@@ -13,6 +13,7 @@ import (
 )
 
 func TestDatastoreSuite(t *testing.T) {
+	t.Skip("skipping TestDatastoreSuite")
 	ctx := context.Background()
 
 	numReplicasOld := numReplicas

@@ -33,10 +33,13 @@ import (
 )
 
 var (
-	logger    = logging.Logger("globaldb")
-	topicName = "globaldb-example"
-	netTopic  = "globaldb-example-net"
-	config    = "globaldb-example"
+	logger = logging.Logger("globaldb")
+	// topicName = "globaldb-example"
+	// netTopic  = "globaldb-example-net"
+	// config    = "globaldb-example"
+	topicName = "pubXXX-dev"
+	netTopic  = "pubXXX-dev-net"
+	config    = "pubXXX-dev"
 )
 
 func main() {
@@ -86,6 +89,7 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
+	// store := dssync.MutexWrap(ds.NewMapDatastore())
 	defer store.Close()
 
 	keyPath := filepath.Join(data, "key")
@@ -122,13 +126,15 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/" + *port)
-
 	h, dht, err := ipfslite.SetupLibp2p(
 		ctx,
 		priv,
 		nil,
-		[]multiaddr.Multiaddr{listen},
+		[]multiaddr.Multiaddr{
+			multiaddr.StringCast("/ip4/0.0.0.0/tcp/" + *port),
+			multiaddr.StringCast("/ip4/0.0.0.0/udp/" + *port + "/quic-v1/webtransport"),
+			multiaddr.StringCast("/ip4/0.0.0.0/tcp/80/ws"),
+		},
 		nil,
 		ipfslite.Libp2pOptionsExtra...,
 	)
@@ -207,14 +213,14 @@ func main() {
 	defer crdt.Close()
 	defer psubCancel()
 
-	fmt.Println("Bootstrapping...")
-
-	bstr, _ := multiaddr.NewMultiaddr("/ip4/94.130.135.167/tcp/33123/ipfs/12D3KooWFta2AE7oiK1ioqjVAKajUJauZWfeM7R413K7ARtHRDAu")
-	inf, _ := peer.AddrInfoFromP2pAddr(bstr)
-	list := append(ipfslite.DefaultBootstrapPeers(), *inf)
-	ipfs.Bootstrap(list)
-	h.ConnManager().TagPeer(inf.ID, "keep", 100)
-
+	// fmt.Println("Bootstrapping...")
+	//
+	// bstr, _ := multiaddr.NewMultiaddr("/ip4/94.130.135.167/tcp/33123/ipfs/12D3KooWFta2AE7oiK1ioqjVAKajUJauZWfeM7R413K7ARtHRDAu")
+	// inf, _ := peer.AddrInfoFromP2pAddr(bstr)
+	// list := append(ipfslite.DefaultBootstrapPeers(), *inf)
+	// ipfs.Bootstrap(list)
+	// h.ConnManager().TagPeer(inf.ID, "keep", 100)
+	//
 	fmt.Printf(`
 Peer ID: %s
 Topic: %s

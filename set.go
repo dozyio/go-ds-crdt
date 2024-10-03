@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -353,10 +354,24 @@ func (s *set) Elements(ctx context.Context, q query.Query) (query.Results, error
 func (s *set) InSet(ctx context.Context, key string) (bool, error) {
 	// Optimization: if we do not have a value
 	// this key was never added.
-	valueK := s.valueKey(key)
-	if ok, err := s.store.Has(ctx, valueK); !ok {
-		return false, err
-	}
+	//valueK := s.valueKey(key)
+	// if ok, err := s.store.Has(ctx, valueK); !ok {
+	// 	return false, err
+	// }
+
+	// _, err := s.store.Has(ctx, valueK)
+	// if err != nil {
+	// 	if errors.Is(err, ds.ErrNotFound) {
+	// 		inSet, err := s.checkNotTombstoned(ctx, key)
+	// 		if err != nil {
+	// 			return false, err
+	// 		}
+	// 		return inSet, nil
+	// 	} else {
+	// 		return false, err
+	// 	}
+	// }
+	// fmt.Printf("%s inSet not has\n", valueK.String())
 
 	// Otherwise, do the long check.
 	return s.checkNotTombstoned(ctx, key)
@@ -375,8 +390,9 @@ func (s *set) InSet(ctx context.Context, key string) (bool, error) {
 func (s *set) checkNotTombstoned(ctx context.Context, key string) (bool, error) {
 	// Bloom filter check: has this key been potentially tombstoned?
 
-	// fmt.Println("Bloom filter check:", key)
+	fmt.Printf("Bloom filter check: %s\n", key)
 	if !s.tombstonesBloom.HasTS([]byte(key)) {
+		fmt.Printf("not in Tombstone bloomfilter %s\n", key)
 		return true, nil
 	}
 
@@ -389,6 +405,7 @@ func (s *set) checkNotTombstoned(ctx context.Context, key string) (bool, error) 
 
 	results, err := s.store.Query(ctx, q)
 	if err != nil {
+		fmt.Printf("query failed: %v %s\n", q, err)
 		return false, err
 	}
 	defer results.Close()
@@ -411,12 +428,15 @@ func (s *set) checkNotTombstoned(ctx context.Context, key string) (bool, error) 
 		// if not tombstoned, we have it
 		inTomb, err := s.inTombsKeyID(ctx, key, id)
 		if err != nil {
+			fmt.Printf("inTombsKeyID failed: %s %s\n", key, id)
 			return false, err
 		}
 		if !inTomb {
+			fmt.Printf("not inTomb %s %s\n", key, id)
 			return true, nil
 		}
 	}
+	fmt.Printf("in Tombstone bloomfilter %s\n", key)
 	return false, nil
 }
 
@@ -470,52 +490,100 @@ func (s *set) setPriority(ctx context.Context, writeStore ds.Write, key string, 
 		return errors.New("error encoding priority")
 	}
 
+	// fmt.Printf("setPriority PUT storing value k %s %s\n", prioK, string(buf[0:n]))
 	return writeStore.Put(ctx, prioK, buf[0:n])
 }
 
 // sets a value if priority is higher. When equal, it sets if the
 // value is lexicographically higher than the current value.
 func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string, value []byte, prio uint64) error {
-	// If this key was tombstoned already, do not store/update the value
-	// at all.
-	deleted, err := s.inTombsKeyID(ctx, key, id)
-	if err != nil || deleted {
+	// fmt.Printf("setValue %s %s prio %d\n", key, string(value), prio)
+	// We no longer need to check for tombstones here, since tombstones should only be handled during merge
+
+	// // If this key was tombstoned already, do not store/update the value
+	// // at all.
+	// println("checking tombstoned")
+	inSet, err := s.InSet(ctx, key)
+	if err != nil {
+		// fmt.Printf("setValue %s %s error checking tombstoned key %s: %s\n", key, string(value), key, err)
 		return err
 	}
 
+	// if inSet {
+	// 	// fmt.Printf("setValue %s %s maybe resurrecting tombstoned key %s\n", key, string(value), key)
+	// }
+
+	// println("getPrio")
 	curPrio, err := s.getPriority(ctx, key)
 	if err != nil {
+		// fmt.Printf("setValue %s %s error getting priority: %s\n", key, string(value), err)
 		return err
 	}
 
 	if prio < curPrio {
+		println("prio < curPrio returning")
 		return nil
 	}
 	valueK := s.valueKey(key)
 
-	if prio == curPrio {
-		curValue, _ := s.store.Get(ctx, valueK)
-		// new value greater than old
-		if bytes.Compare(curValue, value) >= 0 {
+	if inSet {
+		if prio >= curPrio {
+			// curValue, _ := s.store.Get(ctx, valueK)
+			// fmt.Printf("setValue %s %s new prio %d > curPrio %d , overriding tombstoned key %s: %s\n", key, string(value), prio, curPrio, key, string(curValue))
+			// store value
+			// fmt.Printf("setValue PUT curDeleted prio >= curPrio %d, storing value %s\n", prio, string(value))
+			err = writeStore.Put(ctx, valueK, value)
+			if err != nil {
+				return err
+			}
+
+			// store priority
+			err = s.setPriority(ctx, writeStore, key, prio)
+			if err != nil {
+				return err
+			}
+
+			// trigger add hook
+			s.putHook(key, value)
 			return nil
 		}
+
+		if prio < curPrio {
+			// fmt.Printf("setValue %s %s new prio < curPrio, not overriding tombstoned key %s\n", key, string(value), key)
+			return nil
+		}
+	} else {
+		// Not inSet
+		if prio == curPrio {
+			// fmt.Printf("setValue %s %s !deleted new prio == curPrio, checking lex %s\n", key, string(value), key)
+			curValue, _ := s.store.Get(ctx, valueK)
+			// Only override if the new value is lexicographically greater
+			if bytes.Compare(curValue, value) >= 0 {
+				println("lex old value greater, returning")
+				return nil
+			}
+		}
+
+		// fmt.Printf("setValue %s %s !deleted new prio != curPrio\n", key, string(value))
+		// store value
+		// fmt.Printf("setValue PUT !curDeleted prio %d, storing value %s\n", prio, string(value))
+		err = writeStore.Put(ctx, valueK, value)
+		if err != nil {
+			return err
+		}
+
+		// store priority
+		err = s.setPriority(ctx, writeStore, key, prio)
+		if err != nil {
+			return err
+		}
+
+		// trigger add hook
+		s.putHook(key, value)
+		return nil
 	}
 
-	// store value
-	err = writeStore.Put(ctx, valueK, value)
-	if err != nil {
-		return err
-	}
-
-	// store priority
-	err = s.setPriority(ctx, writeStore, key, prio)
-	if err != nil {
-		return err
-	}
-
-	// trigger add hook
-	s.putHook(key, value)
-	return nil
+	panic("unreachable")
 }
 
 // putElems adds items to the "elems" set. It will also set current
@@ -528,10 +596,12 @@ func (s *set) setValue(ctx context.Context, writeStore ds.Write, key, id string,
 // the batch is written), and one lock per key might be way worse than a single
 // global lock in the end.
 func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio uint64) error {
+	// fmt.Printf("\n\nputElems\n")
 	s.putElemsMux.Lock()
 	defer s.putElemsMux.Unlock()
 
 	if len(elems) == 0 {
+		// fmt.Printf("putElems no elems\n")
 		return nil
 	}
 
@@ -541,39 +611,161 @@ func (s *set) putElems(ctx context.Context, elems []*pb.Element, id string, prio
 	if batching {
 		store, err = batchingDs.Batch(ctx)
 		if err != nil {
+			// fmt.Printf("batch failed: %s\n", err)
 			return err
 		}
 	}
 
 	for _, e := range elems {
 		e.Id = id // overwrite the identifier as it would come unset
+		// fmt.Printf("putElems e id %s\n", e.Id)
 		key := e.GetKey()
 		// /namespace/elems/<key>/<id>
 		k := s.elemsPrefix(key).ChildString(id)
-		err := store.Put(ctx, k, nil)
+
+		// XXXX check curelem prio
+		curPrio, err := s.getPriority(ctx, key)
 		if err != nil {
+			// fmt.Printf("getPriority failed: %s\n", err)
 			return err
 		}
+		// fmt.Printf("putElems curPrio %d\n", curPrio)
+
+		// fmt.Printf("putElems inSet check %s\n", key)
+		inSet, err := s.InSet(ctx, key)
+		if err != nil {
+			// fmt.Printf("InSetfailed: %s\n", err)
+			return err
+		}
+
+		if !inSet {
+			// fmt.Printf("%s already deleted or not inSet - should we resurrect?\n", key)
+			if prio >= curPrio {
+				// add wins, same prio
+				// fmt.Printf("prio %d >= curPrio %d resurrecting tombstoned key %s\n", prio, curPrio, key)
+				// fmt.Printf("putElems deleted PUT storing value k %s %d\n", k, prio)
+				err := store.Put(ctx, k, nil)
+				if err != nil {
+					// fmt.Printf("store PUT failed: %s\n", err)
+					return err
+				}
+				err = s.setValue(ctx, store, key, id, e.GetValue(), prio)
+				if err != nil {
+					// fmt.Printf("setValue failed: %s\n", err)
+					return err
+				}
+			} else {
+				// fmt.Printf("prio < curPrio continuing\n")
+				continue
+			}
+		}
+
+		if inSet {
+			// fmt.Printf("%s not deleted\n", key)
+			// qr, err := s.store.Query(ctx, query.Query{})
+			// if err != nil {
+			// 	// fmt.Printf("query failed: %s\n", err)
+			// 	return err
+			// }
+			//
+			// for entry := range qr.Next() {
+			// 	// fmt.Printf("putElems inSet entry %s: %s\n", entry.Key, string(entry.Value))
+			// }
+
+			if prio >= curPrio {
+				// fmt.Printf("prio %d >= curPrio %d, resurrecting tombstoned key %s\n", prio, curPrio, key)
+				// fmt.Printf("putElems inSet PUT storing value k %s %d\n", k, prio)
+				err := store.Put(ctx, k, nil)
+				if err != nil {
+					// fmt.Printf("store PUT failed: %s\n", err)
+					return err
+				}
+				err = s.setValue(ctx, store, key, id, e.GetValue(), prio)
+				if err != nil {
+					// fmt.Printf("setValue failed: %s\n", err)
+					return err
+				}
+			} else {
+				// fmt.Printf("prio < curPrio returning\n")
+				continue
+			}
+		}
+
+		// if !deleted || (deleted && curPrio <= prio) {
+		// 	// fmt.Printf("putElems !deleted || deleted && curPrio <= prio\n")
+		// 	// fmt.Printf("putElems PUT storing value k %s %d\n", k, prio)
+		// 	err := store.Put(ctx, k, nil)
+		// 	if err != nil {
+		// 		// fmt.Printf("store PUT failed: %s\n", err)
+		// 		return err
+		// 	}
+		// }
 
 		// update the value if applicable:
 		// * higher priority than we currently have.
 		// * not tombstoned before.
-		err = s.setValue(ctx, store, key, id, e.GetValue(), prio)
-		if err != nil {
-			return err
-		}
+		// err = s.setValue(ctx, store, key, id, e.GetValue(), prio)
+		// if err != nil {
+		// 	// fmt.Printf("setValue failed: %s\n", err)
+		// 	return err
+		// }
 	}
 
 	if batching {
 		err := store.(ds.Batch).Commit(ctx)
 		if err != nil {
+			// fmt.Printf("batch commit failed: %s\n", err)
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
+// func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, priority uint64) error {
+// 	if len(tombs) == 0 {
+// 		return nil
+// 	}
+//
+// 	var store ds.Write = s.store
+// 	var err error
+// 	batchingDs, batching := store.(ds.Batching)
+// 	if batching {
+// 		store, err = batchingDs.Batch(ctx)
+// 		if err != nil {
+// 			return err
+// 		}
+// 	}
+//
+// 	deletedElems := make(map[string]struct{})
+// 	for _, e := range tombs {
+// 		// /namespace/tombs/<key>/<id>
+// 		elemKey := e.GetKey()
+// 		k := s.tombsPrefix(elemKey).ChildString(e.GetId())
+// 		err := store.Put(ctx, k, nil)
+// 		if err != nil {
+// 			return err
+// 		}
+// 		s.tombstonesBloom.AddTS([]byte(elemKey))
+// 		//fmt.Println("Bloom filter add:", elemKey)
+// 		// run delete hook only once for all
+// 		// versions of the same element tombstoned
+// 		// in this delta
+// 		if _, ok := deletedElems[elemKey]; !ok {
+// 			deletedElems[elemKey] = struct{}{}
+// 			s.deleteHook(elemKey)
+// 		}
+// 	}
+//
+// 	if batching {
+// 		err := store.(ds.Batch).Commit(ctx)
+// 		if err != nil {
+// 			return err
+// 		}
+// 	}
+// 	return nil
+// }
+
+func (s *set) putTombs(ctx context.Context, tombs []*pb.Element, priority uint64) error {
 	if len(tombs) == 0 {
 		return nil
 	}
@@ -593,18 +785,46 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 		// /namespace/tombs/<key>/<id>
 		elemKey := e.GetKey()
 		k := s.tombsPrefix(elemKey).ChildString(e.GetId())
-		err := store.Put(ctx, k, nil)
+		curPrio, err := s.getPriority(ctx, elemKey)
 		if err != nil {
 			return err
 		}
-		s.tombstonesBloom.AddTS([]byte(elemKey))
-		//fmt.Println("Bloom filter add:", elemKey)
-		// run delete hook only once for all
-		// versions of the same element tombstoned
-		// in this delta
-		if _, ok := deletedElems[elemKey]; !ok {
-			deletedElems[elemKey] = struct{}{}
-			s.deleteHook(elemKey)
+
+		if priority > curPrio {
+			// fmt.Printf("putTombs %s %s prio %d > curPrio %d, tombstoning\n", elemKey, string(e.GetValue()), priority, curPrio)
+			valueK := s.valueKey(elemKey)
+			// fmt.Printf("deleting %s\n", valueK)
+			err = s.store.Delete(ctx, valueK)
+			if err != nil {
+				fmt.Printf("store Delete failed: %s\n", err)
+				return err
+			}
+
+			err := store.Put(ctx, k, nil)
+			if err != nil {
+				// fmt.Printf("store PUT failed: %s\n", err)
+				return err
+			}
+
+			// store tombstone priority // is this a thing?
+			err = s.setPriority(ctx, store, elemKey, priority)
+			if err != nil {
+				// fmt.Printf("setPriority failed: %s\n", err)
+				return err
+			}
+
+			s.tombstonesBloom.AddTS([]byte(elemKey))
+			//fmt.Println("Bloom filter add:", elemKey)
+
+			// run delete hook only once for all
+			// versions of the same element tombstoned
+			// in this delta
+			if _, ok := deletedElems[elemKey]; !ok {
+				deletedElems[elemKey] = struct{}{}
+				s.deleteHook(elemKey)
+			}
+		} else {
+			// fmt.Printf("putTombs %s %s prio %d <= curPrio %d, no tombstoning\n", elemKey, string(e.GetValue()), priority, curPrio)
 		}
 	}
 
@@ -618,12 +838,14 @@ func (s *set) putTombs(ctx context.Context, tombs []*pb.Element) error {
 }
 
 func (s *set) Merge(ctx context.Context, d *pb.Delta, id string) error {
-	err := s.putTombs(ctx, d.GetTombstones())
+	priority := d.GetPriority()
+
+	err := s.putTombs(ctx, d.GetTombstones(), priority)
 	if err != nil {
 		return err
 	}
 
-	return s.putElems(ctx, d.GetElements(), id, d.GetPriority())
+	return s.putElems(ctx, d.GetElements(), id, priority)
 }
 
 // currently unused

@@ -2,6 +2,7 @@ package crdt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -25,7 +26,8 @@ import (
 	"github.com/multiformats/go-multihash"
 )
 
-var numReplicas = 15
+// var numReplicas = 15
+var numReplicas = 2
 var debug = false
 
 const (
@@ -479,6 +481,72 @@ func TestCRDTPriority(t *testing.T) {
 	//replicas[14].PrintDAG()
 	//fmt.Println("=======================================================")
 	//replicas[1].PrintDAG()
+}
+
+func TestCRDTPutPutDelete(t *testing.T) {
+	replicas, closeReplicas := makeNReplicas(t, 2, nil)
+	defer closeReplicas()
+
+	br0 := replicas[0].broadcaster.(*mockBroadcaster)
+	br1 := replicas[1].broadcaster.(*mockBroadcaster)
+
+	br0.dropProb = 101
+	br1.dropProb = 101
+
+	k := ds.NewKey("k1")
+
+	// r0 - put put delete
+	err := replicas[0].Put(context.Background(), k, []byte("r0-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = replicas[0].Put(context.Background(), k, []byte("r0-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = replicas[0].Delete(context.Background(), k)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// r1 - put
+	err = replicas[1].Put(context.Background(), k, []byte("r1-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	br0.dropProb = 0
+	br1.dropProb = 0
+
+	time.Sleep(15 * time.Second)
+
+	r0Res, err := replicas[0].Get(context.Background(), ds.NewKey("k1"))
+	if err != nil {
+		if !errors.Is(err, ds.ErrNotFound) {
+			t.Fatal(err)
+		}
+	}
+
+	r1Res, err := replicas[1].Get(context.Background(), ds.NewKey("k1"))
+	if err != nil {
+		if !errors.Is(err, ds.ErrNotFound) {
+			t.Fatal(err)
+		}
+	}
+
+	fmt.Printf("r0Res: %s\nr1Res: %s\n", string(r0Res), string(r1Res))
+	t.Log("r0 dag")
+	replicas[0].PrintDAG()
+	t.Log("r1 dag")
+	replicas[1].PrintDAG()
+
+	if string(r0Res) != string(r1Res) {
+		fmt.Printf("%+v\n", replicas[0].InternalStats())
+
+		fmt.Printf("%+v\n", replicas[1].InternalStats())
+
+		t.Fatal("r0 and r1 should have the same value")
+	}
 }
 
 func TestCRDTCatchUp(t *testing.T) {

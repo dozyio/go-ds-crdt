@@ -164,3 +164,4 @@ require (
 )
 
 replace github.com/pion/stun v1.17.3 => github.com/pion/stun v0.6.1
+replace github.com/ipfs/go-ds-crdt => ../../
